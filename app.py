@@ -219,7 +219,10 @@ def render_signal_table(signals: list[dict], class_name: str):
         hide_index=True,
         column_config={
             "Kelly_%": st.column_config.NumberColumn("Kelly %", format="%.2f%%"),
-            "Win_Rate": st.column_config.NumberColumn("Win Rate", format="%.0f%%"),
+            "Win_Rate": st.column_config.NumberColumn("Win Rate", format="%.1f%%"),
+            "Backtest_Trades": st.column_config.NumberColumn("BT Trades", format="%d"),
+            "Dist_to_Mean_%": st.column_config.NumberColumn("Dist to Mean %", format="%.2f%%"),
+            "ATR_%": st.column_config.NumberColumn("ATR %", format="%.2f%%"),
             "Signal_Strength": st.column_config.ProgressColumn(
                 "Signal Strength", min_value=0, max_value=1.5, format="%.3f",
             ),
@@ -401,7 +404,10 @@ st.header("📐 Kelly Sizing Summary")
 
 all_active = [s for s in all_signals if s["Status"] in ("Entry Triggered", "Hold")]
 if all_active:
-    kelly_df = pd.DataFrame(all_active)[["Ticker", "Class", "Status", "Close", "Kelly_%", "Win_Rate", "Stop_Loss", "ATR"]]
+    kelly_cols = ["Ticker", "Class", "Status", "Close", "Kelly_%", "Win_Rate", "Backtest_Trades", "Stop_Loss", "ATR"]
+    # Only include columns that exist (varies by class)
+    available_cols = [c for c in kelly_cols if c in pd.DataFrame(all_active).columns]
+    kelly_df = pd.DataFrame(all_active)[available_cols]
     kelly_df = kelly_df.sort_values("Kelly_%", ascending=False)
 
     col_kelly, col_chart = st.columns([1, 1])
@@ -412,7 +418,8 @@ if all_active:
             hide_index=True,
             column_config={
                 "Kelly_%": st.column_config.NumberColumn("Kelly %", format="%.2f%%"),
-                "Win_Rate": st.column_config.NumberColumn("Win Rate", format="%.0f%%"),
+                "Win_Rate": st.column_config.NumberColumn("Win Rate", format="%.1f%%"),
+                "Backtest_Trades": st.column_config.NumberColumn("BT Trades", format="%d"),
             },
         )
     with col_chart:

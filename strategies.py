@@ -39,16 +39,17 @@ def _prev(df: pd.DataFrame, col: str):
 
 # ── Historical Backtest Engine ───────────────────────────────────────────────
 
-def _backtest_mean_reversion(df: pd.DataFrame) -> dict:
+def _backtest_mean_reversion(df: pd.DataFrame, max_hold_days: int = 5) -> dict:
     """
     Backtest Class I logic over history.
     Entry: Close <= BB_Lower AND RSI < 30 AND Price > SMA200 AND KDJ_J > KDJ_D
-    Exit: Close >= BB_Mid OR RSI > 50
+    Exit: Close >= BB_Mid OR RSI > 50 OR held for max_hold_days (time exit)
     Returns dict with win_rate, avg_win, avg_loss, n_trades.
     """
     trades = []
     in_trade = False
     entry_price = 0.0
+    bars_held = 0
 
     close = df["Close"].values
     sma200 = df["SMA_200"].values
@@ -69,8 +70,11 @@ def _backtest_mean_reversion(df: pd.DataFrame) -> dict:
                     and kdj_j[i] > kdj_d[i]):
                 in_trade = True
                 entry_price = close[i]
+                bars_held = 0
         else:
-            if close[i] >= bb_mid[i] or rsi_arr[i] > 50:
+            bars_held += 1
+            # Exit: target hit, RSI recovery, OR time-based exit
+            if close[i] >= bb_mid[i] or rsi_arr[i] > 50 or bars_held >= max_hold_days:
                 pnl = (close[i] - entry_price) / entry_price
                 trades.append(pnl)
                 in_trade = False
@@ -206,11 +210,12 @@ def _dynamic_kelly(win_rate: float, target_return: float, stop_distance: float,
 
 # ── CLASS I: HIGH-PRECISION MEAN REVERSION ───────────────────────────────────
 
-def class1_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10) -> list[dict]:
+def class1_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10,
+                z_factors: dict = None) -> list[dict]:
     """
     Oversold in Uptrend.
     Entry: Price > SMA200 AND Close <= BB_Lower(20,2σ) AND RSI14 < 30 AND KDJ_J > KDJ_D
-    Exit: BB Mid (SMA20) or RSI > 50
+    Exit: BB Mid (SMA20) or RSI > 50 or 5-day time exit
     Stop: 1.0 × ATR(14) below entry low
     Sizing: Quarter Kelly (fraction=0.25)
     """
@@ -280,6 +285,10 @@ def class1_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10) -> list[
         stop_loss = float(low - 1.0 * atr_val)
         target = float(bb_mid)
 
+        # Signal strength using winsorized Z-score of RSI (inverted: lower RSI = stronger)
+        rsi_z = z_factors.get("RSI_14", {}).get(ticker, 0) if z_factors else 0
+        sig_strength = round(max(0, -rsi_z), 3)  # negative Z = more oversold = stronger signal
+
         signals.append({
             "Ticker": ticker,
             "Class": "I - Mean Reversion",
@@ -294,9 +303,9 @@ def class1_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10) -> list[
             "Stop_Loss": round(stop_loss, 2),
             "ATR": round(atr_val, 2),
             "Kelly_%": round(kelly_pct, 2),
-            "Win_Rate": round(win_rate * 100, 1),  # stored as percentage (e.g. 80.0)
+            "Win_Rate": round(win_rate * 100, 1),
             "Backtest_Trades": bt["n_trades"],
-            "Signal_Strength": round(abs(30 - rsi_val) / 30, 3),
+            "Signal_Strength": sig_strength,
             "Volatility": round(atr_val / close * 100, 2),
         })
 
@@ -306,7 +315,8 @@ def class1_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10) -> list[
 
 # ── CLASS II: BALANCED TREND RESONANCE ───────────────────────────────────────
 
-def class2_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10) -> list[dict]:
+def class2_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10,
+                z_factors: dict = None) -> list[dict]:
     """
     Pullback Continuation.
     Momentum Score: 0.6 * Z(ROC12) + 0.4 * Z(MACD_Hist). Pick top 10%.
@@ -316,12 +326,10 @@ def class2_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10) -> list[
     Sizing: Half Kelly (fraction=0.50).
 
     Universe filter: excludes LOW_VOL_EXCLUDE set.
+    Uses pre-winsorized Z-scores from _preprocess_factors.
     """
-    # Phase 1: compute indicators, collect momentum factors
-    roc_values = {}
-    macd_values = {}
+    # Phase 1: compute indicators for eligible tickers
     ticker_dfs = {}
-
     for ticker, raw_df in all_data.items():
         if ticker in LOW_VOL_EXCLUDE:
             continue
@@ -329,24 +337,13 @@ def class2_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10) -> list[
         if len(df) < 200:
             continue
         ticker_dfs[ticker] = df
-        roc_val = _latest(df, "ROC_12")
-        macd_hist = _latest(df, "MACD_Hist")
-        if not np.isnan(roc_val):
-            roc_values[ticker] = roc_val
-        if not np.isnan(macd_hist):
-            macd_values[ticker] = macd_hist
 
-    if not roc_values or not macd_values:
+    if not ticker_dfs:
         return []
 
-    # Phase 2: Proper cross-sectional Winsorization then Z-score
-    roc_series = pd.Series(roc_values)
-    macd_series = pd.Series(macd_values)
-    roc_ws = winsorize_series(roc_series)
-    macd_ws = winsorize_series(macd_series)
-
-    z_roc = cross_sectional_zscore(roc_ws.to_dict())
-    z_macd = cross_sectional_zscore(macd_ws.to_dict())
+    # Phase 2: Use pre-computed winsorized Z-scores for momentum ranking
+    z_roc = z_factors.get("ROC_12", {}) if z_factors else {}
+    z_macd = z_factors.get("MACD_Hist", {}) if z_factors else {}
 
     # Combined momentum score
     momentum_scores = {}
@@ -429,7 +426,8 @@ def class2_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10) -> list[
 
 # ── CLASS III: EXPLOSIVE BREAKOUT ENGINE ─────────────────────────────────────
 
-def class3_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10) -> list[dict]:
+def class3_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10,
+                z_factors: dict = None) -> list[dict]:
     """
     Fat-Tail Volatility Squeeze.
     Entry: Price > Upper Donchian(20) AND ADX14 > 30 (rising) AND BB Width at 3-month low.
@@ -438,6 +436,7 @@ def class3_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10) -> list[
     Sizing: Fractional Kelly (fraction=0.33).
 
     Universe filter: excludes LOW_VOL_EXCLUDE; requires ATR% > 2%.
+    Uses pre-winsorized ADX Z-score for signal strength.
     """
     signals = []
     for ticker, raw_df in all_data.items():
@@ -507,6 +506,10 @@ def class3_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10) -> list[
         trailing_stop = float(high - 2.5 * atr_val)
         exit_level = float(dc_mid_10) if not np.isnan(dc_mid_10) else float(close * 0.95)
 
+        # Signal strength using winsorized ADX Z-score (higher = stronger trend)
+        adx_z = z_factors.get("ADX_14", {}).get(ticker, 0) if z_factors else 0
+        sig_strength = round(max(0, adx_z), 3)
+
         signals.append({
             "Ticker": ticker,
             "Class": "III - Breakout Engine",
@@ -523,7 +526,7 @@ def class3_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10) -> list[
             "Kelly_%": round(kelly_pct, 2),
             "Win_Rate": round(win_rate * 100, 1),
             "Backtest_Trades": bt["n_trades"],
-            "Signal_Strength": round(adx_val / 50, 3),
+            "Signal_Strength": sig_strength,
             "Volatility": round(atr_pct, 2),
         })
 
@@ -531,14 +534,52 @@ def class3_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10) -> list[
     return signals[:max_picks]
 
 
+# ── Cross-Sectional Factor Preprocessing ─────────────────────────────────────
+
+def _preprocess_factors(all_data: dict[str, pd.DataFrame]) -> dict[str, dict]:
+    """
+    Winsorize ALL raw factors (RSI, ADX, ROC, MACD_Hist) at [1%, 99%]
+    cross-sectionally, then compute Z-scores.
+    Returns dict: ticker -> {factor_name: z_score}.
+    """
+    factor_names = ["RSI_14", "ADX_14", "ROC_12", "MACD_Hist"]
+    raw_factors = {f: {} for f in factor_names}
+    ticker_dfs = {}
+
+    for ticker, raw_df in all_data.items():
+        df = compute_indicators(raw_df)
+        if len(df) < 50:
+            continue
+        ticker_dfs[ticker] = df
+        for f in factor_names:
+            val = _latest(df, f)
+            if not np.isnan(val):
+                raw_factors[f][ticker] = val
+
+    # Winsorize each factor cross-sectionally, then Z-score
+    z_scores = {f: {} for f in factor_names}
+    for f in factor_names:
+        if len(raw_factors[f]) < 3:
+            z_scores[f] = {k: 0.0 for k in raw_factors[f]}
+            continue
+        series = pd.Series(raw_factors[f])
+        ws = winsorize_series(series, limits=(0.01, 0.01))
+        z_scores[f] = cross_sectional_zscore(ws.to_dict())
+
+    return z_scores
+
+
 # ── UNIFIED SCAN ─────────────────────────────────────────────────────────────
 
 def run_all_strategies(all_data: dict[str, pd.DataFrame]) -> dict[str, list[dict]]:
     """Run all three strategy classes and return results."""
+    # Pre-compute winsorized Z-scores for all factors
+    z_factors = _preprocess_factors(all_data)
+
     return {
-        "class1": class1_scan(all_data),
-        "class2": class2_scan(all_data),
-        "class3": class3_scan(all_data),
+        "class1": class1_scan(all_data, z_factors=z_factors),
+        "class2": class2_scan(all_data, z_factors=z_factors),
+        "class3": class3_scan(all_data, z_factors=z_factors),
     }
 
 

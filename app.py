@@ -221,6 +221,12 @@ def render_signal_table(signals: list[dict], class_name: str):
             "Kelly_%": st.column_config.NumberColumn("Kelly %", format="%.2f%%"),
             "Win_Rate": st.column_config.NumberColumn("Win Rate %", format="%.1f"),
             "Backtest_Trades": st.column_config.NumberColumn("BT Trades", format="%d"),
+            "Confirmed": st.column_config.TextColumn("Confirmed"),
+            "RRR": st.column_config.NumberColumn("RRR", format="%.2f"),
+            "Target": st.column_config.NumberColumn("Target", format="$%.2f"),
+            "Stop_Loss": st.column_config.NumberColumn("Stop Loss", format="$%.2f"),
+            "Trailing_Stop": st.column_config.NumberColumn("Trail Stop", format="$%.2f"),
+            "Exit_DC_Mid": st.column_config.NumberColumn("Exit DC Mid", format="$%.2f"),
             "Dist_to_Mean_%": st.column_config.NumberColumn("Dist to Mean %", format="%.2f%%"),
             "ATR_%": st.column_config.NumberColumn("ATR %", format="%.2f%%"),
             "Signal_Strength": st.column_config.ProgressColumn(
@@ -404,7 +410,7 @@ st.header("📐 Kelly Sizing Summary")
 
 all_active = [s for s in all_signals if s["Status"] in ("Entry Triggered", "Hold")]
 if all_active:
-    kelly_cols = ["Ticker", "Class", "Status", "Close", "Kelly_%", "Win_Rate", "Backtest_Trades", "Stop_Loss", "ATR"]
+    kelly_cols = ["Ticker", "Class", "Status", "Confirmed", "Close", "Target", "Stop_Loss", "RRR", "Kelly_%", "Win_Rate", "Backtest_Trades", "ATR"]
     # Only include columns that exist (varies by class)
     available_cols = [c for c in kelly_cols if c in pd.DataFrame(all_active).columns]
     kelly_df = pd.DataFrame(all_active)[available_cols]
@@ -420,6 +426,10 @@ if all_active:
                 "Kelly_%": st.column_config.NumberColumn("Kelly %", format="%.2f%%"),
                 "Win_Rate": st.column_config.NumberColumn("Win Rate %", format="%.1f"),
                 "Backtest_Trades": st.column_config.NumberColumn("BT Trades", format="%d"),
+                "Confirmed": st.column_config.TextColumn("Confirmed"),
+                "RRR": st.column_config.NumberColumn("RRR", format="%.2f"),
+                "Target": st.column_config.NumberColumn("Target", format="$%.2f"),
+                "Stop_Loss": st.column_config.NumberColumn("Stop Loss", format="$%.2f"),
             },
         )
     with col_chart:

@@ -1,13 +1,13 @@
 """
 Three strategy classes for the Momentum Engine.
-Each returns signals with entry/exit/stop/sizing info.
 
-Fixes applied:
-- Historical backtested win rates per ticker (not static placeholders)
-- Dynamic asset-specific Kelly: f* = p - (1-p)/b
-- Proper cross-sectional Winsorization before Z-scoring
-- Universe filtering (exclude low-vol ETFs; ATR% > 2% for Class III)
-- Distance to Mean indicator for Class I
+Professional quant logic:
+- Empirical backtested win rates (n_trades shown, <30 = Unconfirmed)
+- Dynamic Kelly via actual RRR: b = (Target-Close)/(Close-StopLoss)
+- Cross-sectional Winsorization [1%,99%] on all factors before Z-scoring
+- 5-day time exit for Class I mean reversion
+- Liquidity filter: AvgDailyVolume > $10M, ATR% > 1% for Class II/III
+- ATR% > 2% gate for Class III breakout candidates
 """
 from __future__ import annotations
 
@@ -18,49 +18,62 @@ from indicators import (
     exponential_weights, sma,
 )
 
-# ── Low-volatility / non-momentum assets to exclude from Class II & III ──────
+# ── Assets excluded from momentum strategies ────────────────────────────────
 LOW_VOL_EXCLUDE = {
     "SGOV", "BIL", "SHV", "SHY", "IEF", "TLT", "VGSH", "BSV", "AGG",
-    "BND", "GOVT", "SCHO", "SPMO",  # bond/treasury ETFs + factor ETFs
+    "BND", "GOVT", "SCHO", "SPMO",
 }
+
+# Minimum sample size for confirmed signals
+MIN_CONFIRMED_TRADES = 30
 
 
 def _latest(df: pd.DataFrame, col: str):
-    """Get latest non-NaN value from a column."""
     s = df[col].dropna()
     return float(s.iloc[-1]) if len(s) > 0 else np.nan
 
 
 def _prev(df: pd.DataFrame, col: str):
-    """Get second-to-last non-NaN value."""
     s = df[col].dropna()
     return float(s.iloc[-2]) if len(s) > 1 else np.nan
+
+
+def _avg_dollar_volume(df: pd.DataFrame, window: int = 20) -> float:
+    """Average daily dollar volume over last `window` days."""
+    if len(df) < window:
+        return 0.0
+    recent = df.tail(window)
+    dv = (recent["Close"] * recent["Volume"]).mean()
+    return float(dv) if not np.isnan(dv) else 0.0
 
 
 # ── Historical Backtest Engine ───────────────────────────────────────────────
 
 def _backtest_mean_reversion(df: pd.DataFrame, max_hold_days: int = 5) -> dict:
     """
-    Backtest Class I logic over history.
+    Backtest Class I: Oversold-in-uptrend mean reversion.
     Entry: Close <= BB_Lower AND RSI < 30 AND Price > SMA200 AND KDJ_J > KDJ_D
-    Exit: Close >= BB_Mid OR RSI > 50 OR held for max_hold_days (time exit)
-    Returns dict with win_rate, avg_win, avg_loss, n_trades.
+    Exit: Close >= BB_Mid OR RSI > 50 OR 5-day time exit OR stop loss hit
+    Stop: 1.0 × ATR below entry low
     """
     trades = []
     in_trade = False
     entry_price = 0.0
+    entry_stop = 0.0
     bars_held = 0
 
     close = df["Close"].values
+    low_arr = df["Low"].values
     sma200 = df["SMA_200"].values
     bb_lower = df["BB_Lower"].values
     bb_mid = df["BB_Mid"].values
     rsi_arr = df["RSI_14"].values
     kdj_j = df["KDJ_J"].values
     kdj_d = df["KDJ_D"].values
+    atr_arr = df["ATR_14"].values
 
     for i in range(200, len(df)):
-        if np.isnan(sma200[i]) or np.isnan(bb_lower[i]) or np.isnan(rsi_arr[i]):
+        if np.isnan(sma200[i]) or np.isnan(bb_lower[i]) or np.isnan(rsi_arr[i]) or np.isnan(atr_arr[i]):
             continue
         if not in_trade:
             if (close[i] > sma200[i]
@@ -70,11 +83,14 @@ def _backtest_mean_reversion(df: pd.DataFrame, max_hold_days: int = 5) -> dict:
                     and kdj_j[i] > kdj_d[i]):
                 in_trade = True
                 entry_price = close[i]
+                entry_stop = low_arr[i] - 1.0 * atr_arr[i]
                 bars_held = 0
         else:
             bars_held += 1
-            # Exit: target hit, RSI recovery, OR time-based exit
-            if close[i] >= bb_mid[i] or rsi_arr[i] > 50 or bars_held >= max_hold_days:
+            if (close[i] >= bb_mid[i]
+                    or rsi_arr[i] > 50
+                    or bars_held >= max_hold_days
+                    or close[i] <= entry_stop):
                 pnl = (close[i] - entry_price) / entry_price
                 trades.append(pnl)
                 in_trade = False
@@ -84,17 +100,19 @@ def _backtest_mean_reversion(df: pd.DataFrame, max_hold_days: int = 5) -> dict:
 
     wins = [t for t in trades if t > 0]
     losses = [t for t in trades if t <= 0]
-    win_rate = len(wins) / len(trades) if trades else 0.0
-    avg_win = np.mean(wins) if wins else 0.0
-    avg_loss = abs(np.mean(losses)) if losses else 0.0
-    return {"win_rate": win_rate, "avg_win": avg_win, "avg_loss": avg_loss, "n_trades": len(trades)}
+    return {
+        "win_rate": len(wins) / len(trades),
+        "avg_win": np.mean(wins) if wins else 0.0,
+        "avg_loss": abs(np.mean(losses)) if losses else 0.0,
+        "n_trades": len(trades),
+    }
 
 
 def _backtest_trend_resonance(df: pd.DataFrame) -> dict:
     """
-    Backtest Class II logic over history.
+    Backtest Class II: Pullback continuation.
     Entry: Close near EMA20 (±2%), closes above prev high, Vol > 1.2x SMA50(Vol)
-    Exit: 20% gain OR price drops 1.5 × ATR below EMA50
+    Exit: 2.0 × ATR profit OR 20% gain OR stop (1.5 × ATR below EMA50)
     """
     trades = []
     in_trade = False
@@ -120,8 +138,9 @@ def _backtest_trend_resonance(df: pd.DataFrame) -> dict:
                 entry_price = close[i]
         else:
             gain = (close[i] - entry_price) / entry_price
+            atr_target = (entry_price + 2.0 * atr_arr[i])
             stop_hit = close[i] < ema50[i] - 1.5 * atr_arr[i]
-            if gain >= 0.20 or stop_hit:
+            if close[i] >= atr_target or gain >= 0.20 or stop_hit:
                 trades.append(gain)
                 in_trade = False
 
@@ -140,7 +159,7 @@ def _backtest_trend_resonance(df: pd.DataFrame) -> dict:
 
 def _backtest_breakout(df: pd.DataFrame) -> dict:
     """
-    Backtest Class III logic over history.
+    Backtest Class III: Volatility squeeze breakout.
     Entry: Close > DC_Upper_20 AND ADX > 30 (rising) AND Vol > 1.5x avg
     Exit: Close < DC_Mid_10 OR trailing stop (2.5 × ATR from peak)
     """
@@ -171,7 +190,7 @@ def _backtest_breakout(df: pd.DataFrame) -> dict:
         else:
             peak_price = max(peak_price, close[i])
             trailing_stop = peak_price - 2.5 * atr_arr[i]
-            if close[i] < dc_mid_10[i] or close[i] < trailing_stop:
+            if not np.isnan(dc_mid_10[i]) and (close[i] < dc_mid_10[i] or close[i] < trailing_stop):
                 pnl = (close[i] - entry_price) / entry_price
                 trades.append(pnl)
                 in_trade = False
@@ -189,22 +208,22 @@ def _backtest_breakout(df: pd.DataFrame) -> dict:
     }
 
 
-# ── Dynamic Kelly ────────────────────────────────────────────────────────────
+# ── Dynamic Kelly via RRR ────────────────────────────────────────────────────
 
-def _dynamic_kelly(win_rate: float, target_return: float, stop_distance: float,
-                   fraction: float = 1.0) -> float:
+def _kelly_rrr(win_rate: float, target: float, close: float, stop_loss: float,
+               fraction: float = 1.0) -> float:
     """
-    Asset-specific Kelly: f* = p - (1-p)/b
-    where b = target_return / stop_distance (reward/risk ratio).
-    Clamped to [0, 0.25] for safety. Multiplied by fraction for fractional Kelly.
+    Kelly% = p - (1-p)/b
+    where b = (Target - Close) / (Close - StopLoss)  [Reward-to-Risk Ratio]
+    Clamped to [0, 25%]. Multiplied by fraction for fractional Kelly.
     """
-    if stop_distance <= 0 or target_return <= 0:
+    risk = close - stop_loss
+    reward = target - close
+    if risk <= 0 or reward <= 0:
         return 0.0
-    b = target_return / stop_distance
-    if b <= 0:
-        return 0.0
+    b = reward / risk
     f = win_rate - (1 - win_rate) / b
-    f = max(0.0, min(0.25, f))  # hard cap at 25%
+    f = max(0.0, min(0.25, f))
     return f * fraction
 
 
@@ -213,9 +232,9 @@ def _dynamic_kelly(win_rate: float, target_return: float, stop_distance: float,
 def class1_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10,
                 z_factors: dict = None) -> list[dict]:
     """
-    Oversold in Uptrend.
-    Entry: Price > SMA200 AND Close <= BB_Lower(20,2σ) AND RSI14 < 30 AND KDJ_J > KDJ_D
-    Exit: BB Mid (SMA20) or RSI > 50 or 5-day time exit
+    Oversold in Uptrend. 5-day time exit.
+    Entry: Price > SMA200 AND Close <= BB_Lower AND RSI14 < 30 AND KDJ_J > KDJ_D
+    Exit: BB Mid or RSI > 50 or 5-day forced exit
     Stop: 1.0 × ATR(14) below entry low
     Sizing: Quarter Kelly (fraction=0.25)
     """
@@ -238,61 +257,41 @@ def class1_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10,
         if any(np.isnan(v) for v in [close, sma200, bb_lower, bb_mid, rsi_val, kdj_j, kdj_d, atr_val]):
             continue
 
-        # ── Signal status ────────────────────────────────────────────────
         entry_triggered = (
             close > sma200
             and close <= bb_lower
             and rsi_val < 30
             and kdj_j > kdj_d
         )
-        hold = (
-            close > sma200
-            and close > bb_lower
-            and close < bb_mid
-            and rsi_val < 50
-        )
-        watch = (
-            close > sma200
-            and rsi_val < 40
-            and close < bb_mid
-        )
+        hold = (close > sma200 and close > bb_lower and close < bb_mid and rsi_val < 50)
+        watch = (close > sma200 and rsi_val < 40 and close < bb_mid)
 
         if not (entry_triggered or hold or watch):
             continue
 
-        # ── Distance to Mean (margin of safety) ─────────────────────────
+        # ── Distance to Mean ─────────────────────────────────────────────
         dist_to_mean_pct = (bb_mid - close) / close * 100
-        dist_to_lower_pct = (close - bb_lower) / close * 100
 
-        # ── Historical backtest ──────────────────────────────────────────
-        bt = _backtest_mean_reversion(df)
-        # Use backtested rate if sufficient trades, else fallback to target
-        if bt["n_trades"] >= 5:
-            win_rate = bt["win_rate"]
-            avg_win = bt["avg_win"]
-            avg_loss = bt["avg_loss"]
-        else:
-            win_rate = 0.80
-            avg_win = float(bb_mid - close) / close if close > 0 else 0.02
-            avg_loss = float(atr_val) / close if close > 0 else 0.01
+        # ── Empirical backtest ───────────────────────────────────────────
+        bt = _backtest_mean_reversion(df, max_hold_days=5)
+        win_rate = bt["win_rate"] if bt["n_trades"] >= 3 else 0.80
+        confirmed = bt["n_trades"] >= MIN_CONFIRMED_TRADES
 
-        # ── Dynamic Kelly (Quarter) ──────────────────────────────────────
-        target_return = float(bb_mid - close) / close if close > 0 else 0.0
-        stop_distance = float(atr_val) / close if close > 0 else 0.0
-        kelly_pct = _dynamic_kelly(win_rate, target_return, stop_distance, fraction=0.25) * 100
+        # ── Kelly via RRR ────────────────────────────────────────────────
+        target = float(bb_mid)
+        stop_loss = float(low - 1.0 * atr_val)
+        kelly_pct = _kelly_rrr(win_rate, target, close, stop_loss, fraction=0.25) * 100
 
         status = "Entry Triggered" if entry_triggered else ("Hold" if hold else "Watch")
-        stop_loss = float(low - 1.0 * atr_val)
-        target = float(bb_mid)
 
-        # Signal strength using winsorized Z-score of RSI (inverted: lower RSI = stronger)
         rsi_z = z_factors.get("RSI_14", {}).get(ticker, 0) if z_factors else 0
-        sig_strength = round(max(0, -rsi_z), 3)  # negative Z = more oversold = stronger signal
+        sig_strength = round(max(0, -rsi_z), 3)
 
         signals.append({
             "Ticker": ticker,
             "Class": "I - Mean Reversion",
             "Status": status,
+            "Confirmed": "Yes" if confirmed else "Unconfirmed",
             "Close": round(close, 2),
             "RSI": round(rsi_val, 1),
             "BB_Lower": round(bb_lower, 2),
@@ -301,6 +300,7 @@ def class1_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10,
             "Dist_to_Mean_%": round(dist_to_mean_pct, 2),
             "Target": round(target, 2),
             "Stop_Loss": round(stop_loss, 2),
+            "RRR": round((target - close) / (close - stop_loss), 2) if close > stop_loss else 0,
             "ATR": round(atr_val, 2),
             "Kelly_%": round(kelly_pct, 2),
             "Win_Rate": round(win_rate * 100, 1),
@@ -319,16 +319,9 @@ def class2_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10,
                 z_factors: dict = None) -> list[dict]:
     """
     Pullback Continuation.
-    Momentum Score: 0.6 * Z(ROC12) + 0.4 * Z(MACD_Hist). Pick top 10%.
-    Entry: Price pulls back to EMA20, closes above prev high, Volume > 1.2 × SMA50(Vol).
-    Exit: 2.0 × ATR(14) or 20% gain.
-    Stop: 1.5 × ATR(14) below EMA50.
-    Sizing: Half Kelly (fraction=0.50).
-
-    Universe filter: excludes LOW_VOL_EXCLUDE set.
-    Uses pre-winsorized Z-scores from _preprocess_factors.
+    Momentum Score: 0.6 * Z(ROC12) + 0.4 * Z(MACD_Hist). Top 10%.
+    Liquidity filter: AvgDailyVolume > $10M, ATR% > 1%.
     """
-    # Phase 1: compute indicators for eligible tickers
     ticker_dfs = {}
     for ticker, raw_df in all_data.items():
         if ticker in LOW_VOL_EXCLUDE:
@@ -336,28 +329,33 @@ def class2_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10,
         df = compute_indicators(raw_df)
         if len(df) < 200:
             continue
+
+        # ── Liquidity filter ─────────────────────────────────────────────
+        adv = _avg_dollar_volume(df)
+        if adv < 10_000_000:
+            continue
+        atr_pct = _latest(df, "ATR_14") / _latest(df, "Close") * 100
+        if np.isnan(atr_pct) or atr_pct < 1.0:
+            continue
+
         ticker_dfs[ticker] = df
 
     if not ticker_dfs:
         return []
 
-    # Phase 2: Use pre-computed winsorized Z-scores for momentum ranking
     z_roc = z_factors.get("ROC_12", {}) if z_factors else {}
     z_macd = z_factors.get("MACD_Hist", {}) if z_factors else {}
 
-    # Combined momentum score
     momentum_scores = {}
     for ticker in ticker_dfs:
         r = z_roc.get(ticker, 0)
         m = z_macd.get(ticker, 0)
         momentum_scores[ticker] = 0.6 * r + 0.4 * m
 
-    # Top 10% by momentum
     sorted_tickers = sorted(momentum_scores, key=momentum_scores.get, reverse=True)
     top_n = max(1, len(sorted_tickers) // 10)
     top_tickers = sorted_tickers[:top_n]
 
-    # Phase 3: check entry conditions for top momentum tickers
     signals = []
     for ticker in top_tickers:
         df = ticker_dfs[ticker]
@@ -383,35 +381,32 @@ def class2_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10,
         if not (entry_triggered or hold or watch):
             continue
 
-        # ── Historical backtest ──────────────────────────────────────────
         bt = _backtest_trend_resonance(df)
-        if bt["n_trades"] >= 5:
-            win_rate = bt["win_rate"]
-        else:
-            win_rate = 0.70
+        win_rate = bt["win_rate"] if bt["n_trades"] >= 3 else 0.70
+        confirmed = bt["n_trades"] >= MIN_CONFIRMED_TRADES
 
-        # ── Dynamic Kelly (Half) ─────────────────────────────────────────
-        target_return = min(2.0 * atr_val / close, 0.20)
-        stop_distance = 1.5 * atr_val / close
-        kelly_pct = _dynamic_kelly(win_rate, target_return, stop_distance, fraction=0.50) * 100
-
-        status = "Entry Triggered" if entry_triggered else ("Hold" if hold else "Watch")
         stop_loss = float(ema50 - 1.5 * atr_val)
         target_atr = float(close + 2.0 * atr_val)
         target_20pct = float(close * 1.20)
+        target = min(target_atr, target_20pct)
+
+        kelly_pct = _kelly_rrr(win_rate, target, close, stop_loss, fraction=0.50) * 100
+
+        status = "Entry Triggered" if entry_triggered else ("Hold" if hold else "Watch")
 
         signals.append({
             "Ticker": ticker,
             "Class": "II - Trend Resonance",
             "Status": status,
+            "Confirmed": "Yes" if confirmed else "Unconfirmed",
             "Close": round(close, 2),
             "Momentum_Score": round(momentum_scores[ticker], 3),
             "ROC_12_Z": round(z_roc.get(ticker, 0), 3),
             "MACD_Z": round(z_macd.get(ticker, 0), 3),
             "EMA_20": round(ema20, 2),
-            "Target_ATR": round(target_atr, 2),
-            "Target_20pct": round(target_20pct, 2),
+            "Target": round(target, 2),
             "Stop_Loss": round(stop_loss, 2),
+            "RRR": round((target - close) / (close - stop_loss), 2) if close > stop_loss else 0,
             "ATR": round(atr_val, 2),
             "Kelly_%": round(kelly_pct, 2),
             "Win_Rate": round(win_rate * 100, 1),
@@ -430,13 +425,7 @@ def class3_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10,
                 z_factors: dict = None) -> list[dict]:
     """
     Fat-Tail Volatility Squeeze.
-    Entry: Price > Upper Donchian(20) AND ADX14 > 30 (rising) AND BB Width at 3-month low.
-    Validation: Volume > 1.5 × monthly average.
-    Exit: Close < 10-day Donchian Mid or 2.5 × ATR(14) trailing stop from peak.
-    Sizing: Fractional Kelly (fraction=0.33).
-
-    Universe filter: excludes LOW_VOL_EXCLUDE; requires ATR% > 2%.
-    Uses pre-winsorized ADX Z-score for signal strength.
+    Liquidity filter: AvgDailyVolume > $10M, ATR% > 2%.
     """
     signals = []
     for ticker, raw_df in all_data.items():
@@ -451,7 +440,10 @@ def class3_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10,
         if np.isnan(close) or np.isnan(atr_val) or close <= 0:
             continue
 
-        # ── ATR% gate: only high-volatility assets for breakout ──────────
+        # ── Liquidity + volatility filter ────────────────────────────────
+        adv = _avg_dollar_volume(df)
+        if adv < 10_000_000:
+            continue
         atr_pct = atr_val / close * 100
         if atr_pct < 2.0:
             continue
@@ -469,7 +461,6 @@ def class3_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10,
         if any(np.isnan(v) for v in [dc_upper, adx_val, bb_width, vol, vol_sma_20]):
             continue
 
-        # ── Entry conditions ─────────────────────────────────────────────
         above_donchian = close > dc_upper
         adx_strong = adx_val > 30
         adx_rising = adx_val > adx_prev if not np.isnan(adx_prev) else False
@@ -478,35 +469,31 @@ def class3_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10,
 
         entry_triggered = above_donchian and adx_strong and adx_rising and bb_squeeze and volume_confirm
 
-        # Near-breakout watch (use parentheses to fix operator precedence bug)
         near_breakout = (
             close > dc_upper * 0.98
             and adx_val > 25
             and (bb_width < bb_width_3m_min * 1.2 if not np.isnan(bb_width_3m_min) else False)
         )
 
-        hold = above_donchian and adx_strong and close > dc_mid_10 if not np.isnan(dc_mid_10) else False
+        hold = (above_donchian and adx_strong
+                and (close > dc_mid_10 if not np.isnan(dc_mid_10) else False))
 
         if not (entry_triggered or hold or near_breakout):
             continue
 
-        # ── Historical backtest ──────────────────────────────────────────
         bt = _backtest_breakout(df)
-        if bt["n_trades"] >= 5:
-            win_rate = bt["win_rate"]
-        else:
-            win_rate = 0.60
+        win_rate = bt["win_rate"] if bt["n_trades"] >= 3 else 0.60
+        confirmed = bt["n_trades"] >= MIN_CONFIRMED_TRADES
 
-        # ── Dynamic Kelly (Fractional 0.33) ──────────────────────────────
-        target_return = 2.5 * atr_val / close
-        stop_distance = 2.5 * atr_val / close
-        kelly_pct = _dynamic_kelly(win_rate, target_return, stop_distance, fraction=0.33) * 100
-
-        status = "Entry Triggered" if entry_triggered else ("Hold" if hold else "Watch")
         trailing_stop = float(high - 2.5 * atr_val)
         exit_level = float(dc_mid_10) if not np.isnan(dc_mid_10) else float(close * 0.95)
+        target = float(close + 2.5 * atr_val)
+        stop_loss = trailing_stop
 
-        # Signal strength using winsorized ADX Z-score (higher = stronger trend)
+        kelly_pct = _kelly_rrr(win_rate, target, close, stop_loss, fraction=0.33) * 100
+
+        status = "Entry Triggered" if entry_triggered else ("Hold" if hold else "Watch")
+
         adx_z = z_factors.get("ADX_14", {}).get(ticker, 0) if z_factors else 0
         sig_strength = round(max(0, adx_z), 3)
 
@@ -514,14 +501,17 @@ def class3_scan(all_data: dict[str, pd.DataFrame], max_picks: int = 10,
             "Ticker": ticker,
             "Class": "III - Breakout Engine",
             "Status": status,
+            "Confirmed": "Yes" if confirmed else "Unconfirmed",
             "Close": round(close, 2),
             "Donchian_Upper": round(dc_upper, 2),
             "ADX": round(adx_val, 1),
             "BB_Width": round(bb_width, 4),
             "ATR_%": round(atr_pct, 2),
             "Volume_Ratio": round(vol / vol_sma_20, 2) if vol_sma_20 > 0 else 0,
+            "Target": round(target, 2),
             "Trailing_Stop": round(trailing_stop, 2),
             "Exit_DC_Mid": round(exit_level, 2),
+            "RRR": round((target - close) / (close - stop_loss), 2) if close > stop_loss else 0,
             "ATR": round(atr_val, 2),
             "Kelly_%": round(kelly_pct, 2),
             "Win_Rate": round(win_rate * 100, 1),
@@ -540,23 +530,19 @@ def _preprocess_factors(all_data: dict[str, pd.DataFrame]) -> dict[str, dict]:
     """
     Winsorize ALL raw factors (RSI, ADX, ROC, MACD_Hist) at [1%, 99%]
     cross-sectionally, then compute Z-scores.
-    Returns dict: ticker -> {factor_name: z_score}.
     """
     factor_names = ["RSI_14", "ADX_14", "ROC_12", "MACD_Hist"]
     raw_factors = {f: {} for f in factor_names}
-    ticker_dfs = {}
 
     for ticker, raw_df in all_data.items():
         df = compute_indicators(raw_df)
         if len(df) < 50:
             continue
-        ticker_dfs[ticker] = df
         for f in factor_names:
             val = _latest(df, f)
             if not np.isnan(val):
                 raw_factors[f][ticker] = val
 
-    # Winsorize each factor cross-sectionally, then Z-score
     z_scores = {f: {} for f in factor_names}
     for f in factor_names:
         if len(raw_factors[f]) < 3:
@@ -572,10 +558,7 @@ def _preprocess_factors(all_data: dict[str, pd.DataFrame]) -> dict[str, dict]:
 # ── UNIFIED SCAN ─────────────────────────────────────────────────────────────
 
 def run_all_strategies(all_data: dict[str, pd.DataFrame]) -> dict[str, list[dict]]:
-    """Run all three strategy classes and return results."""
-    # Pre-compute winsorized Z-scores for all factors
     z_factors = _preprocess_factors(all_data)
-
     return {
         "class1": class1_scan(all_data, z_factors=z_factors),
         "class2": class2_scan(all_data, z_factors=z_factors),
@@ -584,7 +567,6 @@ def run_all_strategies(all_data: dict[str, pd.DataFrame]) -> dict[str, list[dict
 
 
 def get_top15_tickers(results: dict[str, list[dict]]) -> list[str]:
-    """Get top 15 unique tickers across all classes for AV verification."""
     seen = set()
     top = []
     for cls in ["class1", "class2", "class3"]:

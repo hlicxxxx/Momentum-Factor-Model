@@ -219,7 +219,7 @@ def render_signal_table(signals: list[dict], class_name: str):
         hide_index=True,
         column_config={
             "Kelly_%": st.column_config.NumberColumn("Kelly %", format="%.2f%%"),
-            "Win_Rate": st.column_config.NumberColumn("Win Rate", format="%.1f%%"),
+            "Win_Rate": st.column_config.NumberColumn("Win Rate %", format="%.1f"),
             "Backtest_Trades": st.column_config.NumberColumn("BT Trades", format="%d"),
             "Dist_to_Mean_%": st.column_config.NumberColumn("Dist to Mean %", format="%.2f%%"),
             "ATR_%": st.column_config.NumberColumn("ATR %", format="%.2f%%"),
@@ -418,7 +418,7 @@ if all_active:
             hide_index=True,
             column_config={
                 "Kelly_%": st.column_config.NumberColumn("Kelly %", format="%.2f%%"),
-                "Win_Rate": st.column_config.NumberColumn("Win Rate", format="%.1f%%"),
+                "Win_Rate": st.column_config.NumberColumn("Win Rate %", format="%.1f"),
                 "Backtest_Trades": st.column_config.NumberColumn("BT Trades", format="%d"),
             },
         )
